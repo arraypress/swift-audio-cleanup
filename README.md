@@ -37,18 +37,28 @@ public protocol NoiseReducer: Sendable {
 }
 ```
 
-The built-in `SpectralGateReducer` is the default. A companion **`AudioCleanupAI`**
-product (planned) will provide a `DeepFilterNet3` reducer via CoreML for an
-opt-in "AI cleanup" mode — so the ML dependency and its ~one-time model download
-only load when a consumer adds that product. Only the noise-reduction stage
-swaps; the EQ / de-ess / compression / normalization around it stay shared.
+The built-in `SpectralGateReducer` is the default. The companion **`AudioCleanupAI`**
+product provides `DeepFilterNetReducer` — **DeepFilterNet3 via Core ML** — for an
+opt-in "AI cleanup" mode. It bundles the model (2.2 MB), so the Core ML dependency
+and weights only load when a consumer adds that product. Only the noise-reduction
+stage swaps; the EQ / de-ess / compression / normalization around it stay shared.
 
 ```swift
-// default (spectral gate):
+import AudioCleanup
+import AudioCleanupAI
+
+// default (spectral gate — zero deps, every platform):
 try await AudioCleaner.clean(videoURL: url)
-// injected reducer:
-try await AudioCleaner.clean(videoURL: url, noiseReducer: myReducer)
+// AI cleanup (DeepFilterNet3, best quality):
+try await AudioCleaner.clean(videoURL: url, noiseReducer: DeepFilterNetReducer())
 ```
+
+`DeepFilterNet3` is 48 kHz native. The neural forward pass runs in Core ML; the
+STFT, ERB filterbank, exponential normalizers and the complex *deep filter* run
+on Accelerate/vDSP — all verified bit-for-bit against DeepFilterNet's own `libdf`
+and the reference PyTorch model. Audio at any other rate is resampled to 48 kHz
+for the pass and back. The model is Apache-2.0 / MIT
+([`aufklarer/DeepFilterNet3-CoreML`](https://huggingface.co/aufklarer/DeepFilterNet3-CoreML)).
 
 ## Why not Apple's Voice Isolation?
 
