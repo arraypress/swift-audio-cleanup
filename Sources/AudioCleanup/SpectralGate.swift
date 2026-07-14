@@ -8,14 +8,16 @@
 import Accelerate
 import Foundation
 
-/// Classic spectral-subtraction noise reduction, on-device via vDSP.
+/// Spectral noise reduction, on-device via vDSP.
 ///
-/// Estimates the noise floor per frequency bin from the quietest stretches
-/// of the recording (a low percentile across STFT frames), then attenuates
-/// each bin toward that floor with fast-attack/slow-release gain smoothing —
-/// steady noise (hiss, room tone, traffic) drops away while speech onsets
-/// pass through untouched. This is the standard algorithm behind
-/// "remove background noise" buttons; Apple ships no offline equivalent.
+/// Estimates the noise floor per frequency bin from the quietest stretches of
+/// the recording (a low percentile across STFT frames — no noise sample
+/// needed), then attenuates each bin with a **Wiener gain** driven by a
+/// **decision-directed** a-priori SNR (Ephraim–Malah) and **smoothed across
+/// frequency**. Steady noise (hiss, room tone, traffic) drops away while speech
+/// passes through, with far less of the "musical noise" (warbling isolated
+/// bins) that plain magnitude subtraction leaves behind. Apple ships no offline
+/// equivalent.
 enum SpectralGate {
 
     private static let frameSize = 2048
@@ -74,10 +76,27 @@ enum SpectralGate {
             noiseFloor[bin] = column[max(0, Int(Float(column.count) * 0.2) - 1)]
         }
 
-        // Pass 2: attenuate each frame toward the floor and overlap-add.
-        let alpha: Float = 1 + strength                 // over-subtraction
+        // Pass 2: decision-directed a-priori SNR → Wiener gain, with
+        // frequency-domain gain smoothing. Two upgrades over plain magnitude
+        // subtraction, both aimed at "musical noise" (warbling isolated bins):
+        //   • Wiener gain ξ/(ξ+1) is a smoother curve than 1 − αN/|X|.
+        //   • the a-priori SNR ξ is estimated decision-directed (Ephraim–Malah),
+        //     blending the previous frame's clean estimate in, so it's smooth
+        //     in time — the classic birdie killer.
+        //   • the per-frame gain vector is convolved across frequency so a
+        //     surviving bin can't chirp on its own.
+        let alpha: Float = 1 + strength                   // over-subtraction
         let minGain = pow(10, -(10 + 14 * strength) / 20) // −10…−24 dB floor
+        let ddWeight: Float = 0.96                         // decision-directed smoothing
+        var noisePower = [Float](repeating: 0, count: bins)
+        for bin in 0..<bins {
+            noisePower[bin] = max(noiseFloor[bin] * noiseFloor[bin], .leastNormalMagnitude)
+        }
+        // 5-tap triangular kernel, normalized to unity.
+        let smoothingKernel: [Float] = [1.0 / 9, 2.0 / 9, 3.0 / 9, 2.0 / 9, 1.0 / 9]
+
         var previousGain = [Float](repeating: 1, count: bins)
+        var previousPosterior = [Float](repeating: 1, count: bins)
         var output = [Float](repeating: 0, count: input.count)
 
         let progressStride = max(1, frameCount / 50)
@@ -89,14 +108,23 @@ enum SpectralGate {
             var spectrum = forward(input, at: offset, window: window, fft: fft, log2n: log2n)
             let mags = magnitudes(of: spectrum, bins: bins)
 
+            var gain = [Float](repeating: 0, count: bins)
             for bin in 0..<bins {
-                let magnitude = max(mags[bin], .leastNormalMagnitude)
-                var gain = max(minGain, 1 - alpha * noiseFloor[bin] / magnitude)
-                // Instant attack (speech onsets open immediately), smoothed
-                // release (decay lingers, suppressing "musical noise").
-                gain = max(gain, previousGain[bin] * 0.75)
-                previousGain[bin] = gain
-                applyGain(gain, to: &spectrum, bin: bin, bins: bins)
+                let power = max(mags[bin] * mags[bin], .leastNormalMagnitude)
+                let posterior = power / noisePower[bin] // γ (a-posteriori SNR)
+                let priorSNR = max(
+                    ddWeight * (previousGain[bin] * previousGain[bin] * previousPosterior[bin])
+                        + (1 - ddWeight) * max(posterior - alpha, 0),
+                    1e-6
+                )
+                gain[bin] = max(minGain, min(1, priorSNR / (priorSNR + 1))) // Wiener
+                previousPosterior[bin] = posterior
+            }
+
+            let smoothed = smoothAcrossFrequency(gain, kernel: smoothingKernel)
+            for bin in 0..<bins {
+                previousGain[bin] = smoothed[bin]
+                applyGain(smoothed[bin], to: &spectrum, bin: bin, bins: bins)
             }
 
             let rebuilt = inverse(spectrum, fft: fft, log2n: log2n)
@@ -120,6 +148,25 @@ enum SpectralGate {
             }
         }
         return output
+    }
+
+    /// Convolves the per-frame gain vector across frequency with a small
+    /// normalized kernel (edges clamped). The single biggest musical-noise
+    /// reducer: a lone bin that survived the gate gets pulled toward its
+    /// neighbours instead of chirping on its own.
+    private static func smoothAcrossFrequency(_ gain: [Float], kernel: [Float]) -> [Float] {
+        let n = gain.count
+        let half = kernel.count / 2
+        var out = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            var sum: Float = 0
+            for (j, weight) in kernel.enumerated() {
+                let index = min(n - 1, max(0, i + j - half))
+                sum += gain[index] * weight
+            }
+            out[i] = sum
+        }
+        return out
     }
 
     // MARK: - FFT plumbing (vDSP packed real format)
