@@ -98,6 +98,11 @@ enum SpectralGate {
         var previousGain = [Float](repeating: 1, count: bins)
         var previousPosterior = [Float](repeating: 1, count: bins)
         var output = [Float](repeating: 0, count: input.count)
+        // Window² coverage per sample — dividing by the constant 1.5 assumed
+        // full 4-window overlap, which only holds from sample 3·hop onward;
+        // the head/tail ramp rendered at as little as 17% amplitude (an
+        // audible click/dip). Normalize by the actual envelope instead.
+        var wsum = [Float](repeating: 0, count: input.count)
 
         let progressStride = max(1, frameCount / 50)
         for frame in 0..<frameCount {
@@ -129,11 +134,15 @@ enum SpectralGate {
 
             let rebuilt = inverse(spectrum, fft: fft, log2n: log2n)
             for i in 0..<n where offset + i < output.count {
-                // Hann is applied at analysis AND synthesis (softens frame
-                // edges after spectral edits); overlapped Hann² at a 75%
-                // hop sums to exactly 1.5.
-                output[offset + i] += rebuilt[i] * window[i] / 1.5
+                // Hann at analysis AND synthesis (softens frame edges after
+                // spectral edits); normalized by the accumulated window²
+                // envelope below (1.5 in steady state at a 75% hop).
+                output[offset + i] += rebuilt[i] * window[i]
+                wsum[offset + i] += window[i] * window[i]
             }
+        }
+        for i in 0..<output.count {
+            output[i] = wsum[i] > 1e-4 ? output[i] / wsum[i] : input[i]
         }
 
         // The first/last hop of a signal isn't fully covered by overlapping
