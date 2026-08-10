@@ -101,3 +101,9 @@ or DeepFilterNet3 — both fully on-device.
 ```
 swift test
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Bundled or downloaded models keep their own licences; see the notes above where a model is named.
